@@ -1,4 +1,4 @@
-# AI vs Real Art Detector — Review-1
+# AI vs Real Art Detector
 
 > Core feasibility pipeline: Vision Embeddings → FAISS Retrieval → Majority Vote Classification
 
