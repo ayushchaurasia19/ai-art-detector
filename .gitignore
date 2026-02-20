@@ -1,0 +1,12 @@
+# Dataset
+dataset/
+
+# Model outputs
+embeddings/
+results/
+
+# Python cache
+__pycache__/
+.pytest_cache/
+*.pyc
+
