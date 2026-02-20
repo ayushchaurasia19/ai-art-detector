@@ -1,11 +1,12 @@
 """
 Review-1: AI vs Real Art Classification Pipeline
-Core end-to-end feasibility pipeline using vision embeddings + vector retrieval + majority vote.
+Core end-to-end feasibility pipeline using vision embeddings + Chroma vector DB + majority vote.
 """
 
 import os
 import json
 import time
+import uuid
 import numpy as np
 from pathlib import Path
 from typing import Tuple
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 from transformers import ViTFeatureExtractor, ViTModel
-import faiss
+import chromadb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, confusion_matrix, precision_score,
@@ -28,19 +29,22 @@ import seaborn as sns
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-DATASET_DIR   = Path("dataset")
-EMBED_DIR     = Path("embeddings")
-RESULTS_DIR   = Path("results")
-IMG_SIZE      = 224
-BATCH_SIZE    = 32
-TOP_K         = 10
-TEST_SPLIT    = 0.2
-RANDOM_SEED   = 42
-MODEL_NAME    = "google/vit-base-patch16-224-in21k"
-LABEL_MAP     = {"ai": 1, "real": 0}
-LABEL_NAMES   = {0: "Real", 1: "AI-Generated"}
+DATASET_DIR     = Path("dataset")
+EMBED_DIR       = Path("embeddings")
+CHROMA_DIR      = Path("chroma_db")        # Chroma persists here on disk
+RESULTS_DIR     = Path("results")
+IMG_SIZE        = 224
+BATCH_SIZE      = 32
+TOP_K           = 10
+TEST_SPLIT      = 0.2
+RANDOM_SEED     = 42
+MODEL_NAME      = "google/vit-base-patch16-224-in21k"
+LABEL_MAP       = {"ai": 1, "real": 0}
+LABEL_NAMES     = {0: "Real", 1: "AI-Generated"}
+COLLECTION_NAME = "art_embeddings"
 
 EMBED_DIR.mkdir(exist_ok=True)
+CHROMA_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 
 
@@ -91,7 +95,7 @@ class ViTEmbedder:
         all_embeddings = []
         total = len(image_paths)
         for i in range(0, total, batch_size):
-            batch_paths = image_paths[i : i + batch_size]
+            batch_paths = image_paths[i: i + batch_size]
             pixel_values_list = []
             for p in batch_paths:
                 try:
@@ -104,58 +108,118 @@ class ViTEmbedder:
 
             batch_tensor = torch.stack(pixel_values_list).to(self.device)
             outputs = self.model(pixel_values=batch_tensor)
-            # CLS token = outputs.last_hidden_state[:, 0, :]
             cls_embeddings = outputs.last_hidden_state[:, 0, :]
             cls_embeddings = F.normalize(cls_embeddings, p=2, dim=1)
             all_embeddings.append(cls_embeddings.cpu().numpy())
 
-            if (i // batch_size + 1) % 5 == 0 or (i + batch_size) >= total:
-                pct = min(i + batch_size, total)
-                print(f"  Embedded {pct}/{total} images", end="\r")
+            pct = min(i + batch_size, total)
+            print(f"  Embedded {pct}/{total} images", end="\r")
 
         print()
         return np.vstack(all_embeddings).astype("float32")
 
 
 # ─────────────────────────────────────────────
-# VECTOR DATABASE (FAISS)
+# VECTOR DATABASE (CHROMA)
 # ─────────────────────────────────────────────
-class FAISSVectorDB:
-    """FAISS inner-product index (cosine sim on L2-normalised vectors)."""
+class ChromaVectorDB:
+    """
+    Chroma-backed vector store — persists to disk automatically.
 
-    def __init__(self, dim: int):
-        self.dim = dim
-        self.index = faiss.IndexFlatIP(dim)   # inner product ≡ cosine after L2 norm
-        self.labels: list = []
+    Each stored entry contains:
+      - embedding  : 768-d ViT CLS vector
+      - metadata   : label (int), label_name, filename, class_dir, resolution
+      - document   : filename string (human-readable, used by Chroma internally)
+    """
 
-    def add(self, embeddings: np.ndarray, labels: list):
-        assert embeddings.shape[0] == len(labels)
-        self.index.add(embeddings)
-        self.labels.extend(labels)
-        print(f"[FAISS] Indexed {len(labels)} vectors  (total: {self.index.ntotal})")
+    def __init__(self, persist_dir: str = str(CHROMA_DIR)):
+        self.client = chromadb.PersistentClient(path=persist_dir)
+        self.collection = self.client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"}   # cosine similarity
+        )
+        print(f"[Chroma] Collection '{COLLECTION_NAME}' loaded "
+              f"({self.collection.count()} existing vectors)")
 
-    def search(self, query: np.ndarray, k: int = TOP_K):
-        distances, indices = self.index.search(query, k)
-        retrieved_labels = [
-            [self.labels[idx] for idx in row if idx != -1]
-            for row in indices
-        ]
-        return distances, indices, retrieved_labels
+    def is_populated(self) -> bool:
+        return self.collection.count() > 0
 
-    def save(self, path: str):
-        faiss.write_index(self.index, path + ".index")
-        with open(path + ".labels.json", "w") as f:
-            json.dump(self.labels, f)
-        print(f"[FAISS] Saved index to {path}.index")
+    def clear(self):
+        """Drop and recreate collection for a clean re-index."""
+        self.client.delete_collection(COLLECTION_NAME)
+        self.collection = self.client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"}
+        )
+        print("[Chroma] Collection cleared and recreated.")
 
-    @classmethod
-    def load(cls, path: str, dim: int):
-        db = cls(dim)
-        db.index = faiss.read_index(path + ".index")
-        with open(path + ".labels.json") as f:
-            db.labels = json.load(f)
-        print(f"[FAISS] Loaded index from {path}.index  ({db.index.ntotal} vectors)")
-        return db
+    def add(self, embeddings: np.ndarray, labels: list, image_paths: list,
+            batch_size: int = 500):
+        """
+        Insert embeddings with rich metadata into Chroma.
+        Metadata stored per vector:
+          - label      : 0 or 1
+          - label_name : 'Real' or 'AI-Generated'
+          - filename   : original image filename
+          - class_dir  : 'ai' or 'real' (source folder)
+          - resolution : '224x224'
+        """
+        total = len(embeddings)
+        assert total == len(labels) == len(image_paths)
+
+        for i in range(0, total, batch_size):
+            batch_emb   = embeddings[i: i + batch_size]
+            batch_lbl   = labels[i: i + batch_size]
+            batch_paths = image_paths[i: i + batch_size]
+
+            ids = [str(uuid.uuid4()) for _ in batch_emb]
+
+            metadatas = [
+                {
+                    "label"     : int(lbl),
+                    "label_name": LABEL_NAMES[int(lbl)],
+                    "filename"  : Path(p).name,
+                    "class_dir" : Path(p).parent.name,
+                    "resolution": f"{IMG_SIZE}x{IMG_SIZE}",
+                }
+                for lbl, p in zip(batch_lbl, batch_paths)
+            ]
+
+            documents = [Path(p).name for p in batch_paths]
+
+            self.collection.add(
+                ids        = ids,
+                embeddings = batch_emb.tolist(),
+                metadatas  = metadatas,
+                documents  = documents,
+            )
+            print(f"  Indexed {min(i + batch_size, total)}/{total} vectors", end="\r")
+
+        print()
+        print(f"[Chroma] Total vectors stored in DB: {self.collection.count()}")
+
+    def search(self, query_embeddings: np.ndarray, k: int = TOP_K):
+        """
+        Query the collection for each embedding in the batch.
+        Returns:
+          - distances         : similarity scores
+          - retrieved_labels  : list of label lists (one per query)
+          - retrieved_metadata: list of metadata dicts (for explainability)
+        """
+        results = self.collection.query(
+            query_embeddings = query_embeddings.tolist(),
+            n_results        = k,
+            include          = ["metadatas", "distances", "documents"]
+        )
+
+        retrieved_labels   = []
+        retrieved_metadata = []
+
+        for meta_row in results["metadatas"]:
+            retrieved_labels.append([m["label"] for m in meta_row])
+            retrieved_metadata.append(meta_row)
+
+        return results["distances"], retrieved_labels, retrieved_metadata
 
 
 # ─────────────────────────────────────────────
@@ -170,9 +234,10 @@ def majority_vote(retrieved_labels: list) -> Tuple[int, str]:
     real_count = len(retrieved_labels) - ai_count
     predicted  = 1 if ai_count >= real_count else 0
     label_name = LABEL_NAMES[predicted]
+    win_count  = ai_count if predicted == 1 else real_count
     explanation = (
         f"This image is classified as {label_name} because "
-        f"{ai_count if predicted == 1 else real_count} out of {len(retrieved_labels)} "
+        f"{win_count} out of {len(retrieved_labels)} "
         f"nearest neighbours are {label_name} images."
     )
     return predicted, explanation
@@ -182,11 +247,11 @@ def majority_vote(retrieved_labels: list) -> Tuple[int, str]:
 # EVALUATION & REPORTING
 # ─────────────────────────────────────────────
 def evaluate(y_true: list, y_pred: list) -> dict:
-    acc  = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec  = recall_score(y_true, y_pred, zero_division=0)
-    f1   = f1_score(y_true, y_pred, zero_division=0)
-    cm   = confusion_matrix(y_true, y_pred)
+    acc    = accuracy_score(y_true, y_pred)
+    prec   = precision_score(y_true, y_pred, zero_division=0)
+    rec    = recall_score(y_true, y_pred, zero_division=0)
+    f1     = f1_score(y_true, y_pred, zero_division=0)
+    cm     = confusion_matrix(y_true, y_pred)
     report = classification_report(
         y_true, y_pred,
         target_names=["Real", "AI-Generated"],
@@ -194,9 +259,9 @@ def evaluate(y_true: list, y_pred: list) -> dict:
     )
     metrics = dict(accuracy=acc, precision=prec, recall=rec, f1=f1)
 
-    print("\n" + "="*55)
+    print("\n" + "=" * 55)
     print("  EVALUATION RESULTS")
-    print("="*55)
+    print("=" * 55)
     for k, v in metrics.items():
         print(f"  {k.capitalize():<12}: {v:.4f}")
     print("\n  Classification Report:")
@@ -216,22 +281,20 @@ def plot_confusion_matrix(cm: list, save_path: Path):
     )
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Actual")
-    ax.set_title("Confusion Matrix – Review-1")
+    ax.set_title("Confusion Matrix - Review-1")
     plt.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
-    print(f"[Plot] Confusion matrix saved → {save_path}")
+    print(f"[Plot] Confusion matrix saved -> {save_path}")
 
 
 def save_metrics(metrics: dict, save_path: Path):
-    serialisable = {
-        k: v for k, v in metrics.items()
-        if k not in ("confusion_matrix", "report")
-    }
+    serialisable = {k: v for k, v in metrics.items()
+                    if k not in ("confusion_matrix", "report")}
     serialisable["confusion_matrix"] = metrics["confusion_matrix"]
     with open(save_path, "w") as f:
         json.dump(serialisable, f, indent=2)
-    print(f"[Save] Metrics JSON → {save_path}")
+    print(f"[Save] Metrics JSON -> {save_path}")
 
 
 # ─────────────────────────────────────────────
@@ -239,9 +302,9 @@ def save_metrics(metrics: dict, save_path: Path):
 # ─────────────────────────────────────────────
 def run_pipeline():
     t0 = time.time()
-    print("\n" + "="*55)
-    print("  AI vs Real Art – Review-1 Pipeline")
-    print("="*55)
+    print("\n" + "=" * 55)
+    print("  AI vs Real Art - Review-1 Pipeline (Chroma)")
+    print("=" * 55)
 
     # ── 1. Load dataset ──────────────────────
     print("\n[Step 1] Loading dataset...")
@@ -258,11 +321,10 @@ def run_pipeline():
         stratify=labels,
         random_state=RANDOM_SEED
     )
-    print(f"\n[Step 2] Split → Train: {len(train_paths)} | Test: {len(test_paths)}")
+    print(f"\n[Step 2] Split -> Train: {len(train_paths)} | Test: {len(test_paths)}")
 
     # ── 3. Feature extraction ─────────────────
     embedder = ViTEmbedder()
-
     embed_train_file = EMBED_DIR / "train_embeddings.npy"
     embed_test_file  = EMBED_DIR / "test_embeddings.npy"
 
@@ -284,15 +346,19 @@ def run_pipeline():
     dim = train_embeddings.shape[1]
     print(f"  Embedding dimension: {dim}")
 
-    # ── 4. Build vector database ─────────────
-    print("\n[Step 4] Building FAISS vector index...")
-    db = FAISSVectorDB(dim)
-    db.add(train_embeddings, train_labels)
-    db.save(str(EMBED_DIR / "faiss_index"))
+    # ── 4. Build Chroma vector database ───────
+    print("\n[Step 4] Setting up Chroma vector database...")
+    db = ChromaVectorDB()
+
+    if db.is_populated():
+        print("[Chroma] DB already populated — skipping re-index.")
+        print("         (Delete the chroma_db/ folder to force a fresh index)")
+    else:
+        db.add(train_embeddings, train_labels, train_paths)
 
     # ── 5. Retrieval + majority vote ──────────
     print(f"\n[Step 5] Classifying test set with Top-K={TOP_K} retrieval...")
-    _, _, retrieved_labels_batch = db.search(test_embeddings, k=TOP_K)
+    _, retrieved_labels_batch, retrieved_meta_batch = db.search(test_embeddings, k=TOP_K)
 
     predictions, explanations = [], []
     for nb_labels in retrieved_labels_batch:
@@ -308,25 +374,31 @@ def run_pipeline():
     plot_confusion_matrix(metrics["confusion_matrix"], RESULTS_DIR / "confusion_matrix.png")
     save_metrics(metrics, RESULTS_DIR / "metrics.json")
 
-    # Sample explanations
+    # Sample explanations with full Chroma metadata
     sample_file = RESULTS_DIR / "sample_explanations.txt"
     with open(sample_file, "w", encoding="utf-8") as f:
         f.write("SAMPLE PREDICTIONS & EXPLANATIONS (first 10 test images)\n")
-        f.write("="*60 + "\n\n")
+        f.write("=" * 60 + "\n\n")
         for i in range(min(10, len(test_paths))):
             true_lbl = LABEL_NAMES[test_labels[i]]
             pred_lbl = LABEL_NAMES[predictions[i]]
             correct  = "[CORRECT]" if test_labels[i] == predictions[i] else "[WRONG]"
-            f.write(f"Image  : {test_paths[i].name}\n")
-            f.write(f"True   : {true_lbl}\n")
-            f.write(f"Pred   : {pred_lbl}  {correct}\n")
-            f.write(f"Reason : {explanations[i]}\n")
-            f.write("-"*60 + "\n")
-    print(f"[Save] Sample explanations → {sample_file}")
+            f.write(f"Image    : {test_paths[i].name}\n")
+            f.write(f"True     : {true_lbl}\n")
+            f.write(f"Pred     : {pred_lbl}  {correct}\n")
+            f.write(f"Reason   : {explanations[i]}\n")
+            f.write("Neighbours from Chroma DB:\n")
+            for j, meta in enumerate(retrieved_meta_batch[i], 1):
+                f.write(f"  [{j:02d}] {meta['filename']:<35} "
+                        f"class={meta['class_dir']:<5}  "
+                        f"label={meta['label_name']}\n")
+            f.write("-" * 60 + "\n")
+    print(f"[Save] Sample explanations -> {sample_file}")
 
     elapsed = time.time() - t0
     print(f"\n[Done] Pipeline completed in {elapsed:.1f}s")
-    print(f"       Results saved to → {RESULTS_DIR}/\n")
+    print(f"       Chroma DB persisted at -> {CHROMA_DIR}/")
+    print(f"       Results saved to       -> {RESULTS_DIR}/\n")
 
 
 if __name__ == "__main__":

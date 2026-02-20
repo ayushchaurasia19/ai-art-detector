@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline import (
     majority_vote,
-    FAISSVectorDB,
+    ChromaVectorDB,
     evaluate,
     LABEL_NAMES,
     load_dataset,
@@ -67,60 +67,79 @@ class TestMajorityVote:
 
 
 # ─────────────────────────────────────────────
-# FAISSVectorDB tests
+# ChromaVectorDB tests
 # ─────────────────────────────────────────────
-class TestFAISSVectorDB:
+class TestChromaVectorDB:
     DIM = 768
 
-    def _make_db_with_data(self):
-        db = FAISSVectorDB(self.DIM)
+    def _make_fake_paths(self, n: int, tmpdir: str) -> list:
+        """Create n dummy image files and return their paths."""
+        paths = []
+        for i in range(n):
+            subdir = "ai" if i % 2 == 0 else "real"
+            d = Path(tmpdir) / subdir
+            d.mkdir(exist_ok=True)
+            p = d / f"img_{i:04d}.png"
+            Image.new("RGB", (8, 8)).save(p)
+            paths.append(p)
+        return paths
+
+    def _make_db_with_data(self, tmpdir: str):
+        db = ChromaVectorDB(persist_dir=tmpdir)
         rng = np.random.default_rng(0)
-        embeddings = rng.random((100, self.DIM)).astype("float32")
-        # L2 normalise (as pipeline does)
+        embeddings = rng.random((20, self.DIM)).astype("float32")
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         embeddings = embeddings / norms
-        labels = [i % 2 for i in range(100)]   # alternating 0/1
-        db.add(embeddings, labels)
+        labels = [i % 2 for i in range(20)]
+        paths = self._make_fake_paths(20, tmpdir)
+        db.add(embeddings, labels, paths)
         return db, embeddings, labels
 
-    def test_index_count_after_add(self):
-        db, _, _ = self._make_db_with_data()
-        assert db.index.ntotal == 100
+    def test_collection_count_after_add(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db, _, _ = self._make_db_with_data(tmpdir)
+            assert db.collection.count() == 20
 
-    def test_labels_stored(self):
-        db, _, labels = self._make_db_with_data()
-        assert len(db.labels) == 100
-        assert db.labels == labels
+    def test_is_populated_true_after_add(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db, _, _ = self._make_db_with_data(tmpdir)
+            assert db.is_populated() is True
+
+    def test_is_populated_false_on_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = ChromaVectorDB(persist_dir=tmpdir)
+            assert db.is_populated() is False
 
     def test_search_returns_k_results(self):
-        db, embeddings, _ = self._make_db_with_data()
-        query = embeddings[:5]
-        _, _, ret_labels = db.search(query, k=10)
-        assert len(ret_labels) == 5
-        for row in ret_labels:
-            assert len(row) == 10
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db, embeddings, _ = self._make_db_with_data(tmpdir)
+            _, ret_labels, _ = db.search(embeddings[:3], k=5)
+            assert len(ret_labels) == 3
+            for row in ret_labels:
+                assert len(row) == 5
 
     def test_search_labels_are_valid(self):
-        db, embeddings, _ = self._make_db_with_data()
-        _, _, ret_labels = db.search(embeddings[:3], k=5)
-        for row in ret_labels:
-            for lbl in row:
-                assert lbl in (0, 1)
-
-    def test_nearest_neighbour_is_self(self):
-        db, embeddings, _ = self._make_db_with_data()
-        query = embeddings[:1]
-        distances, indices, _ = db.search(query, k=1)
-        assert indices[0][0] == 0    # self is closest
-
-    def test_save_and_load(self):
-        db, embeddings, labels = self._make_db_with_data()
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "test_index")
-            db.save(path)
-            db2 = FAISSVectorDB.load(path, self.DIM)
-        assert db2.index.ntotal == 100
-        assert db2.labels == labels
+            db, embeddings, _ = self._make_db_with_data(tmpdir)
+            _, ret_labels, _ = db.search(embeddings[:3], k=5)
+            for row in ret_labels:
+                for lbl in row:
+                    assert lbl in (0, 1)
+
+    def test_metadata_keys_present(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db, embeddings, _ = self._make_db_with_data(tmpdir)
+            _, _, ret_meta = db.search(embeddings[:1], k=3)
+            for meta in ret_meta[0]:
+                for key in ("label", "label_name", "filename", "class_dir", "resolution"):
+                    assert key in meta
+
+    def test_clear_resets_collection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db, _, _ = self._make_db_with_data(tmpdir)
+            assert db.is_populated()
+            db.clear()
+            assert not db.is_populated()
 
 
 # ─────────────────────────────────────────────
