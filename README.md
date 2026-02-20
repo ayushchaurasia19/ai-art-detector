@@ -131,10 +131,6 @@ Tests cover:
 - Packages `pipeline.py` + `requirements.txt` with a `VERSION.txt`
 - Uploads deployment artefact (retained 30 days)
 
-### Secret management
-
-The Gemini API key (for future reviews) is stored as a GitHub Actions secret `GEMINI_API_KEY` and injected via environment variables — never hard-coded.
-
 ---
 
 ## Pipeline Architecture
