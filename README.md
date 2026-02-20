@@ -12,8 +12,8 @@ ai_art_detector/
 ├── requirements.txt
 ├── README.md
 ├── dataset/
-│   ├── ai/                  ← 1000 AI-generated art images
-│   └── real/                ← 1000 real (human-created) art images
+│   ├── ai/                  ← 9600 AI-generated art images
+│   └── real/                ← 9600 real (human-created) art images
 ├── embeddings/              ← Auto-created; cached .npy files + FAISS index
 ├── results/                 ← Auto-created; metrics.json, confusion_matrix.png, sample_explanations.txt
 ├── tests/
@@ -154,14 +154,3 @@ Majority Vote
   ▼
 Prediction + Explanation
 ```
-
----
-
-## Review Roadmap
-
-| Review | Features |
-|--------|----------|
-| **Review-1** ✅ | Embeddings + FAISS retrieval + majority vote + evaluation |
-| Review-2 | Gemini API RAG reasoning + probability calibration |
-| Review-3 | Grad-CAM / attention heatmaps (visual explainability) |
-| Review-4 | FastAPI backend + React frontend web app |
