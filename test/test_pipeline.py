@@ -95,51 +95,72 @@ class TestChromaVectorDB:
         db.add(embeddings, labels, paths)
         return db, embeddings, labels
 
+    @staticmethod
+    def _close(db: ChromaVectorDB):
+        """
+        Explicitly release Chroma's SQLite file lock.
+        Required on Windows — Chroma holds the file open until the client
+        is deleted, which prevents TemporaryDirectory from cleaning up.
+        """
+        del db.collection
+        del db.client
+
     def test_collection_count_after_add(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db, _, _ = self._make_db_with_data(tmpdir)
-            assert db.collection.count() == 20
+            result = db.collection.count()
+            self._close(db)
+        assert result == 20
 
     def test_is_populated_true_after_add(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db, _, _ = self._make_db_with_data(tmpdir)
-            assert db.is_populated() is True
+            result = db.is_populated()
+            self._close(db)
+        assert result is True
 
     def test_is_populated_false_on_empty(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = ChromaVectorDB(persist_dir=tmpdir)
-            assert db.is_populated() is False
+            result = db.is_populated()
+            self._close(db)
+        assert result is False
 
     def test_search_returns_k_results(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db, embeddings, _ = self._make_db_with_data(tmpdir)
             _, ret_labels, _ = db.search(embeddings[:3], k=5)
-            assert len(ret_labels) == 3
-            for row in ret_labels:
-                assert len(row) == 5
+            self._close(db)
+        assert len(ret_labels) == 3
+        for row in ret_labels:
+            assert len(row) == 5
 
     def test_search_labels_are_valid(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db, embeddings, _ = self._make_db_with_data(tmpdir)
             _, ret_labels, _ = db.search(embeddings[:3], k=5)
-            for row in ret_labels:
-                for lbl in row:
-                    assert lbl in (0, 1)
+            self._close(db)
+        for row in ret_labels:
+            for lbl in row:
+                assert lbl in (0, 1)
 
     def test_metadata_keys_present(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db, embeddings, _ = self._make_db_with_data(tmpdir)
             _, _, ret_meta = db.search(embeddings[:1], k=3)
-            for meta in ret_meta[0]:
-                for key in ("label", "label_name", "filename", "class_dir", "resolution"):
-                    assert key in meta
+            self._close(db)
+        for meta in ret_meta[0]:
+            for key in ("label", "label_name", "filename", "class_dir", "resolution"):
+                assert key in meta
 
     def test_clear_resets_collection(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db, _, _ = self._make_db_with_data(tmpdir)
             assert db.is_populated()
             db.clear()
-            assert not db.is_populated()
+            result = db.is_populated()
+            self._close(db)
+        assert result is False
 
 
 # ─────────────────────────────────────────────
